@@ -4,6 +4,7 @@ module WebCrawler (main) where
 
 import           ElmArchitecture            (run, Config(..))
 import qualified Data.ByteString            as B
+import qualified Data.ByteString.Lazy.Char8 as BL
 import           Data.Function              ((&))
 import qualified Data.Map.Strict            as Map
 import           Data.Map.Strict            (Map)
@@ -57,13 +58,13 @@ type Error = Text
 data Status
     = Queued
     | Loading
-    | Succeeded
+    | Succeeded String
     | Failed Error
     deriving (Show, Eq)
 
 -- | All events that our application will respond to
 data Msg
-    = PageLoaded Url [Url]
+    = PageLoaded Url [Url] String
     | FailedToLoad Url Error
     | DrawView
 
@@ -96,7 +97,7 @@ init' manager =
 update :: Msg -> State -> ( State, [ IO Msg ] )
 update msg state =
     case msg of
-        PageLoaded url sublinks ->
+        PageLoaded url sublinks result ->
             loadMore $ state
                     { endpoints = endpoints'
                     }
@@ -104,7 +105,7 @@ update msg state =
                 sublinksMap = Map.fromList [( link, Queued) | link <- sublinks ]
 
                 endpoints' = endpoints state
-                    & Map.insert url Succeeded
+                    & Map.insert url (Succeeded result)
                     & Map.unionWith (flip const) sublinksMap
 
 
@@ -150,11 +151,11 @@ fetch manager domain link =
 
 loadPage :: Manager -> Url -> IO Msg
 loadPage  manager url =
-    either (FailedToLoad url) (PageLoaded url) <$> fetchContent manager url
+    either (FailedToLoad url) (\(urls, result) -> (PageLoaded url urls result)) <$> fetchContent manager url
 
 loadLink :: Manager -> Url -> IO Msg
 loadLink manager url =
-    either (FailedToLoad url) (const $ PageLoaded url []) <$> fetchHead manager url
+    either (FailedToLoad url) (const $ PageLoaded url [] "") <$> fetchHead manager url
 
 -- ===================
 -- View
@@ -175,21 +176,22 @@ report state = unlines
     , "Queued:         " <> show queued
     , "---"
     , "Active links:   " <> show successes
+    , "results:        " <> show (take 20 results)
     , "Broken links:   " <> show errors
     , "---"
     , "Local links:    " <> show (Map.size $ Map.filterWithKey (const . isLocalPage website) $ endpoints state)
     , "External links: " <> show (Map.size $ Map.filterWithKey (const . not . isLocalPage website) $ endpoints state)
     ]
     where
-        (queued, loading, successes, errors) =
+        (queued, loading, successes, results, errors) =
             Map.foldr
-                (\v (q,l,s,e) -> case v of
-                    Queued    -> (q + 1,l,s,e)
-                    Loading   -> (q,l + 1,s,e)
-                    Succeeded -> (q,l,s + 1,e)
-                    Failed _  -> (q,l,s,e + 1)
+                (\v (q,l,s,r,e) -> case v of
+                    Queued    -> (q + 1,l,s,r,e)
+                    Loading   -> (q,l + 1,s,r,e)
+                    Succeeded result -> (q,l,s + 1,r ++ "\n" ++ result,e)
+                    Failed _  -> (q,l,s,r,e + 1)
                 )
-                (0,0,0,0)
+                (0,0,0,"",0)
                 (endpoints state)
 
         isFailure (Failed _) = True
@@ -207,17 +209,18 @@ fetchHead manager url = do
     let req = request  { method = "HEAD"  }
     Right <$> responseHeaders <$> httpLbs req manager
 
-fetchContent :: Manager -> Url -> IO (Either Error [Url])
+fetchContent :: Manager -> Url -> IO (Either Error ([Url], String))
 fetchContent manager url = do
     eHeaders <- fetchHead manager url
     if not $ isWebpage eHeaders
-    then return $ Right []
+    then return $ Right ([], "")
     else do
         request <- parseRequest $ unpack url
         let req = request
         response <- httpLbs req manager
+        let result = responseBody response
         if isSuccess response
-            then return . Right . allLinks url . decodeUtf8 . responseBody $ response
+            then return $ Right (allLinks url (decodeUtf8 result), BL.unpack result)
             else return $ Left "Bad status"
     where
         isWebpage (Left _)        = False
